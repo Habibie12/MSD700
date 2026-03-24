@@ -1,0 +1,90 @@
+#include <Arduino.h>
+
+// ===== LEFT MOTOR =====
+#define mLeftFWD 30
+#define mLeftREV 31
+#define stopModeL 32
+#define m0L 33
+#define mbFreeL 34
+#define mmLPin 2
+
+// ===== RIGHT MOTOR =====
+#define mRightFWD 35
+#define mRightREV 36
+#define stopModeR 37
+#define m0R 38
+#define mbFreeR 39
+#define mmRPin 3
+
+// ===== POWER RELAY =====
+#define powerRelay 24
+
+void stopAll()
+{
+  analogWrite(mmLPin, 0);
+  analogWrite(mmRPin, 0);
+
+  digitalWrite(mLeftFWD, LOW);
+  digitalWrite(mLeftREV, LOW);
+
+  digitalWrite(mRightFWD, LOW);
+  digitalWrite(mRightREV, LOW);
+}
+
+void setup()
+{
+  pinMode(mmLPin, OUTPUT);
+  pinMode(mmRPin, OUTPUT);
+
+  pinMode(mLeftFWD, OUTPUT);
+  pinMode(mLeftREV, OUTPUT);
+  pinMode(mRightFWD, OUTPUT);
+  pinMode(mRightREV, OUTPUT);
+
+  pinMode(stopModeL, OUTPUT);
+  pinMode(stopModeR, OUTPUT);
+  pinMode(m0L, OUTPUT);
+  pinMode(m0R, OUTPUT);
+  pinMode(mbFreeL, OUTPUT);
+  pinMode(mbFreeR, OUTPUT);
+  pinMode(powerRelay, OUTPUT);
+
+  digitalWrite(powerRelay, HIGH);
+
+  digitalWrite(stopModeL, LOW);
+  digitalWrite(stopModeR, LOW);
+
+  digitalWrite(m0L, HIGH);
+  digitalWrite(m0R, HIGH);
+
+  digitalWrite(mbFreeL, HIGH);
+  digitalWrite(mbFreeR, HIGH);
+
+  delay(2000);
+}
+
+void loop()
+{
+  // FORWARD
+  digitalWrite(mLeftFWD, LOW);
+  digitalWrite(mLeftREV, HIGH);
+
+  digitalWrite(mRightFWD, HIGH);
+  digitalWrite(mRightREV, LOW);
+
+  analogWrite(mmLPin, 120);
+  analogWrite(mmRPin, 120);
+
+  delay(3000);
+
+  // STOP
+  analogWrite(mmLPin, 0);
+  analogWrite(mmRPin, 0);
+
+  digitalWrite(mLeftFWD, LOW);
+  digitalWrite(mLeftREV, LOW);
+  digitalWrite(mRightFWD, LOW);
+  digitalWrite(mRightREV, LOW);
+
+  delay(3000);
+}

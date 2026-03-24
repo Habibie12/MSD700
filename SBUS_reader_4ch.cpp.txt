@@ -1,0 +1,90 @@
+#include <Arduino.h>
+#include <math.h>
+
+#define SBUS_FRAME_SIZE 25
+
+uint8_t sbusFrame[SBUS_FRAME_SIZE];
+uint16_t sbusChannel[16];
+
+int sbusIndex = 0;
+bool sbusFrameReady = false;
+
+void readSBUS() {
+  while (Serial1.available()) {
+    uint8_t b = Serial1.read();
+
+    if (sbusIndex == 0 && b != 0x0F)
+      continue;
+
+    if (sbusIndex >= SBUS_FRAME_SIZE)
+      sbusIndex = 0;
+
+    sbusFrame[sbusIndex++] = b;
+
+    if (sbusIndex == SBUS_FRAME_SIZE) {
+      sbusIndex = 0;
+      sbusFrameReady = true;
+    }
+  }
+}
+
+void decodeSBUS() {
+  sbusChannel[0]  = (sbusFrame[1]       | sbusFrame[2]  << 8) & 0x07FF;
+  sbusChannel[1]  = (sbusFrame[2] >> 3  | sbusFrame[3]  << 5) & 0x07FF;
+  sbusChannel[2]  = (sbusFrame[3] >> 6  | sbusFrame[4]  << 2 | sbusFrame[5] << 10) & 0x07FF;
+  sbusChannel[3]  = (sbusFrame[5] >> 1  | sbusFrame[6]  << 7) & 0x07FF;
+  sbusChannel[4]  = (sbusFrame[6] >> 4  | sbusFrame[7]  << 4) & 0x07FF;
+  sbusChannel[5]  = (sbusFrame[7] >> 7  | sbusFrame[8]  << 1 | sbusFrame[9] << 9) & 0x07FF;
+  sbusChannel[6]  = (sbusFrame[9] >> 2  | sbusFrame[10] << 6) & 0x07FF;
+  sbusChannel[7]  = (sbusFrame[10] >> 5 | sbusFrame[11] << 3) & 0x07FF;
+  sbusChannel[8]  = (sbusFrame[12]      | sbusFrame[13] << 8) & 0x07FF;
+  sbusChannel[9]  = (sbusFrame[13] >> 3 | sbusFrame[14] << 5) & 0x07FF;
+  sbusChannel[10] = (sbusFrame[14] >> 6 | sbusFrame[15] << 2 | sbusFrame[16] << 10) & 0x07FF;
+  sbusChannel[11] = (sbusFrame[16] >> 1 | sbusFrame[17] << 7) & 0x07FF;
+  sbusChannel[12] = (sbusFrame[17] >> 4 | sbusFrame[18] << 4) & 0x07FF;
+  sbusChannel[13] = (sbusFrame[18] >> 7 | sbusFrame[19] << 1 | sbusFrame[20] << 9) & 0x07FF;
+  sbusChannel[14] = (sbusFrame[20] >> 2 | sbusFrame[21] << 6) & 0x07FF;
+  sbusChannel[15] = (sbusFrame[21] >> 5 | sbusFrame[22] << 3) & 0x07FF;
+}
+
+float normalizeSBUS(uint16_t value)
+{
+    const float center = 1024.0;
+    const float halfRange = 800.0;  // approximate safe value
+
+    float result = ((float)value - center) / halfRange;
+
+    if (result > 1.0) result = 1.0;
+    if (result < -1.0) result = -1.0;
+
+    return result;
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(100000, SERIAL_8E2);
+
+  Serial.println("SBUS Monitor Started");
+}
+
+void loop() {
+  readSBUS();
+
+  if (sbusFrameReady) {
+    sbusFrameReady = false;
+    decodeSBUS();
+
+float ch1 = normalizeSBUS(sbusChannel[0]);
+float ch2 = normalizeSBUS(sbusChannel[1]);
+float ch3 = normalizeSBUS(sbusChannel[2]);
+float ch4 = normalizeSBUS(sbusChannel[3]);
+
+Serial.print("CH1: "); Serial.print(ch1, 3);
+Serial.print("  CH2: "); Serial.print(ch2, 3);
+Serial.print("  CH3: "); Serial.print(ch3, 3);
+Serial.print("  CH4: "); Serial.print(ch4, 3);
+Serial.println();
+}
+}

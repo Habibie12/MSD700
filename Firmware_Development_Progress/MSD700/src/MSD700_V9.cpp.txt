@@ -1,0 +1,698 @@
+// MSD700.cpp
+// edited by Habibie on 24 April 2026
+// update: Left motor driver changed to Modbus RTU (BLV Series) via Serial2 (pins 16/17)
+//         Right motor driver still uses CN4 I/O (PWM + direction pins)
+//         Odometry retained unchanged
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ModbusRTU.h>
+#include <math.h>
+#include "Odometry.h"
+
+#define SBUS_FRAME_SIZE 25
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ============================================================
+// RIGHT motor driver pins (CN4 I/O - unchanged)
+// ============================================================
+#define mRightFWD 35
+#define mRightREV 36
+#define stopModeR 37
+#define m0R       38
+#define mbFreeR   39
+#define mmRPin    3   // Right motor speed PWM
+
+// ============================================================
+// LEFT motor driver - Modbus RTU via Serial2
+// ============================================================
+#define MODBUS_DE_RE  7       // MAX485 DE/RE pin
+#define MODBUS_SLAVE  1       // BLV driver slave address (SW3 = 1)
+
+// BLV register addresses
+#define BLV_REG_SPEED_NO0_UPPER   0x0480  // Rotation speed No.0 upper
+#define BLV_REG_CMD_UPPER         0x007C  // Driver input command upper
+#define BLV_REG_CMD_LOWER         0x007D  // Driver input command lower
+
+// NET-IN bits in register 0x007D (lower word)
+#define BLV_BIT_FWD   0x0008  // NET-IN3 = FWD
+#define BLV_BIT_REV   0x0010  // NET-IN4 = REV
+#define BLV_BIT_STOP  0x0000  // All zero = stop
+
+// ============================================================
+// Cylinder / Actuator driver pins
+// ============================================================
+#define liftFWD 42
+#define liftREV 43
+#define dumpFWD 44
+#define dumpREV 45
+
+// ============================================================
+// Power relay pin | switch output
+// ============================================================
+#define powerRelay 24
+
+// Stack light relay pin
+#define LightRed 25
+
+// Battery voltage input pin
+#define BatteryPin A6
+
+/*======================================================================
+ * Modbus state machine for left motor
+ *======================================================================*/
+ModbusRTU mb;
+
+// Modbus transaction states
+enum ModbusState {
+    MB_IDLE,
+    MB_WRITE_SPEED,
+    MB_WRITE_CMD
+};
+
+static ModbusState  mbState          = MB_IDLE;
+static bool         mbWaiting        = false;
+static uint16_t     mbSpeedData[2]   = {0, 0};  // registers 0x0480/0x0481
+static uint16_t     mbCmdData[2]     = {0, 0};  // registers 0x007C/0x007D
+
+// Last values actually sent - used for Option-B change detection
+static int32_t  mbLastSentRpm = 0;
+static uint16_t mbLastSentCmd = 0xFFFF;  // force first write
+
+// Pending values to send (set by driveRobot / stopMotor)
+static int32_t  mbPendingRpm = 0;
+static uint16_t mbPendingCmd = BLV_BIT_STOP;
+
+// RPM threshold to trigger a speed register write (Option B)
+#define MB_RPM_CHANGE_THRESHOLD 5
+
+/*======================================================================
+ * Modbus callbacks
+ *======================================================================*/
+bool cbSpeedWrite(Modbus::ResultCode event, uint16_t transactionId, void* data) {
+    mbWaiting = false;
+    if (event == Modbus::EX_SUCCESS) {
+        mbLastSentRpm = mbPendingRpm;
+        mbState = MB_WRITE_CMD;  // proceed to write command next
+    } else {
+        // Retry: stay in MB_WRITE_SPEED, will retry next mb task cycle
+        mbState = MB_WRITE_SPEED;
+    }
+    return true;
+}
+
+bool cbCmdWrite(Modbus::ResultCode event, uint16_t transactionId, void* data) {
+    mbWaiting = false;
+    if (event == Modbus::EX_SUCCESS) {
+        mbLastSentCmd = mbPendingCmd;
+        mbState = MB_IDLE;
+    } else {
+        // Retry: stay in MB_WRITE_CMD
+        mbState = MB_WRITE_CMD;
+    }
+    return true;
+}
+
+/*======================================================================
+ * setLeftMotorModbus()
+ * Call this every loop to push pending RPM + direction to the BLV driver.
+ * Non-blocking - uses ModbusRTU async API.
+ *======================================================================*/
+void setLeftMotorModbus(int32_t rpm) {
+    // Clamp: values 1-79 → 0 (stop), cap at 3000
+    int32_t absRpm = abs(rpm);
+    if (absRpm > 0 && absRpm < 80) absRpm = 0;
+    if (absRpm > 3000)             absRpm = 3000;
+
+    // Determine direction command
+    uint16_t newCmd;
+    if (absRpm == 0 || rpm == 0) {
+        newCmd = BLV_BIT_STOP;
+        absRpm = 0;
+    } else if (rpm > 0) {
+        newCmd = BLV_BIT_FWD;
+    } else {
+        newCmd = BLV_BIT_REV;
+    }
+
+    // Store as pending (picked up by modbus task below)
+    mbPendingRpm = absRpm;
+    mbPendingCmd = newCmd;
+}
+
+/*======================================================================
+ * modbusTask()
+ * Must be called every loop iteration (non-blocking).
+ * Manages the two-step write: speed register → command register.
+ *======================================================================*/
+void modbusTask() {
+    mb.task();  // Must always be called first
+
+    if (mbWaiting) return;  // Still waiting for a response
+
+    switch (mbState) {
+
+        case MB_IDLE: {
+            // Decide what needs updating
+            bool speedChanged = (abs(mbPendingRpm - mbLastSentRpm) > MB_RPM_CHANGE_THRESHOLD);
+            bool cmdChanged   = (mbPendingCmd != mbLastSentCmd);
+
+            if (speedChanged) {
+                // Speed changed - write speed first, then command
+                mbState = MB_WRITE_SPEED;
+            } else if (cmdChanged) {
+                // Only command changed (e.g. direction flip or stop)
+                mbState = MB_WRITE_CMD;
+            }
+            // else: nothing to do, stay idle
+            break;
+        }
+
+        case MB_WRITE_SPEED: {
+            // Pack 32-bit RPM into two 16-bit registers (big endian)
+            mbSpeedData[0] = (uint16_t)((mbPendingRpm >> 16) & 0xFFFF); // upper
+            mbSpeedData[1] = (uint16_t)( mbPendingRpm        & 0xFFFF); // lower
+
+            if (mb.writeHreg(MODBUS_SLAVE, BLV_REG_SPEED_NO0_UPPER,
+                             mbSpeedData, 2, cbSpeedWrite)) {
+                mbWaiting = true;
+            }
+            // If writeHreg returns false (bus busy), stay in MB_WRITE_SPEED
+            // and retry next modbusTask() call
+            break;
+        }
+
+        case MB_WRITE_CMD: {
+            mbCmdData[0] = 0x0000;        // upper word 0x007C - unused
+            mbCmdData[1] = mbPendingCmd;  // lower word 0x007D - FWD/REV/STOP
+
+            if (mb.writeHreg(MODBUS_SLAVE, BLV_REG_CMD_UPPER,
+                             mbCmdData, 2, cbCmdWrite)) {
+                mbWaiting = true;
+            }
+            break;
+        }
+    }
+}
+
+/*======================================================================
+ * SBUS
+ *======================================================================*/
+uint8_t  sbusFrame[SBUS_FRAME_SIZE];
+uint16_t sbusChannel[16];
+int      sbusIndex      = 0;
+bool     sbusFrameReady = false;
+
+unsigned long lastSBUS = 0;
+
+// Speed tuning gains
+float GAIN1 = 2.5;
+float GAIN2 = 2.5;
+
+#undef M_PI
+#define M_PI 3.14159265358979323846
+
+float LINEAR_SPEED_MAX  = 0.462861317f;
+float ANGULAR_SPEED_MAX = 0.74f;
+
+// Global velocity targets
+float g_linear_x  = 0.0f;
+float g_angular_z = 0.0f;
+
+// Calculated wheel RPMs
+float g_left_rpm  = 0.0f;
+float g_right_rpm = 0.0f;
+
+int g_motor_brake = 1;
+
+bool allowOperation = false;
+
+// LCD / battery globals
+unsigned long previousMillis = 0;
+bool  lightState    = false;
+float volt          = 0.0f;
+int   value         = 0;
+float filteredVolt  = 0.0f;
+
+// Mini PC command
+float minipc_linear   = 0.0f;
+float minipc_angular  = 0.0f;
+bool  minipc_cmd_received = false;
+
+// SBUS control values
+float sbus_leftY  = 0.0f;
+float sbus_leftX  = 0.0f;
+float sbus_rightY = 0.0f;
+float sbus_rightX = 0.0f;
+
+bool sbus_power      = false;
+bool sbus_power_last = false;
+int  sbus_mode       = 0;
+
+int           sbus_mode_debounced = 0;
+unsigned long mode_last_change    = 0;
+const unsigned long MODE_DEBOUNCE_TIME = 200;
+
+/*======================================================================
+ * System state machine
+ *======================================================================*/
+enum SystemState {
+    STATE_DISARMED,
+    STATE_ARMED_RC,
+    STATE_ARMED_MINIPC,
+    STATE_ARMED_NEUTRAL
+};
+SystemState   currentState   = STATE_DISARMED;
+unsigned long stateChangeTime = 0;
+
+/*======================================================================
+ * LCD big character data
+ *======================================================================*/
+byte bigChars[8][8] = {
+    {0x1F,0x11,0x11,0x11,0x11,0x11,0x11,0x1F},
+    {0x00,0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    {0x1F,0x01,0x01,0x1F,0x10,0x10,0x10,0x1F},
+    {0x1F,0x01,0x01,0x1F,0x01,0x01,0x01,0x1F},
+    {0x11,0x11,0x11,0x1F,0x01,0x01,0x01,0x01},
+    {0x1F,0x10,0x10,0x1F,0x01,0x01,0x01,0x1F},
+    {0x1F,0x10,0x10,0x1F,0x11,0x11,0x11,0x1F},
+    {0x1F,0x01,0x01,0x01,0x01,0x01,0x01,0x01}
+};
+
+/*======================================================================
+ * SBUS functions
+ *======================================================================*/
+void readSBUS() {
+    while (Serial1.available()) {
+        uint8_t b = Serial1.read();
+        if (sbusIndex == 0) {
+            if (b == 0x0F) sbusFrame[sbusIndex++] = b;
+        } else {
+            sbusFrame[sbusIndex++] = b;
+            if (sbusIndex == SBUS_FRAME_SIZE) {
+                sbusFrameReady = true;
+                lastSBUS       = millis();
+                sbusIndex      = 0;
+            }
+        }
+    }
+}
+
+void decodeSBUS() {
+    sbusChannel[0]  = (sbusFrame[1]        | sbusFrame[2]  << 8) & 0x07FF;
+    sbusChannel[1]  = (sbusFrame[2]  >> 3  | sbusFrame[3]  << 5) & 0x07FF;
+    sbusChannel[2]  = (sbusFrame[3]  >> 6  | sbusFrame[4]  << 2 | sbusFrame[5]  << 10) & 0x07FF;
+    sbusChannel[3]  = (sbusFrame[5]  >> 1  | sbusFrame[6]  << 7) & 0x07FF;
+    sbusChannel[4]  = (sbusFrame[6]  >> 4  | sbusFrame[7]  << 4) & 0x07FF;
+    sbusChannel[5]  = (sbusFrame[7]  >> 7  | sbusFrame[8]  << 1 | sbusFrame[9]  <<  9) & 0x07FF;
+    sbusChannel[6]  = (sbusFrame[9]  >> 2  | sbusFrame[10] << 6) & 0x07FF;
+    sbusChannel[7]  = (sbusFrame[10] >> 5  | sbusFrame[11] << 3) & 0x07FF;
+    sbusChannel[8]  = (sbusFrame[12]       | sbusFrame[13] << 8) & 0x07FF;
+    sbusChannel[9]  = (sbusFrame[13] >> 3  | sbusFrame[14] << 5) & 0x07FF;
+    sbusChannel[10] = (sbusFrame[14] >> 6  | sbusFrame[15] << 2 | sbusFrame[16] << 10) & 0x07FF;
+    sbusChannel[11] = (sbusFrame[16] >> 1  | sbusFrame[17] << 7) & 0x07FF;
+    sbusChannel[12] = (sbusFrame[17] >> 4  | sbusFrame[18] << 4) & 0x07FF;
+    sbusChannel[13] = (sbusFrame[18] >> 7  | sbusFrame[19] << 1 | sbusFrame[20] <<  9) & 0x07FF;
+    sbusChannel[14] = (sbusFrame[20] >> 2  | sbusFrame[21] << 6) & 0x07FF;
+    sbusChannel[15] = (sbusFrame[21] >> 5  | sbusFrame[22] << 3) & 0x07FF;
+}
+
+float normalizeSBUS(uint16_t value) {
+    const float center    = 1024.0f;
+    const float halfRange = 800.0f;
+    float result = ((float)value - center) / halfRange;
+    if (result >  1.0f) result =  1.0f;
+    if (result < -1.0f) result = -1.0f;
+    return result;
+}
+
+float applyDeadzone(float value, float deadzone) {
+    return (abs(value) < deadzone) ? 0.0f : value;
+}
+
+int getDebouncedMode(uint16_t ch6) {
+    int newMode;
+    if      (ch6 < 700)  newMode = -1;
+    else if (ch6 > 1400) newMode =  1;
+    else                 newMode =  0;
+
+    if (newMode != sbus_mode_debounced) {
+        if (millis() - mode_last_change > MODE_DEBOUNCE_TIME) {
+            sbus_mode_debounced = newMode;
+            mode_last_change    = millis();
+        }
+    }
+    return sbus_mode_debounced;
+}
+
+void updateSBUSControl() {
+    if (!sbusFrameReady) return;
+    sbusFrameReady = false;
+    decodeSBUS();
+    lastSBUS = millis();
+
+    const float DEADZONE = 0.10f;
+    sbus_leftY  = applyDeadzone(normalizeSBUS(sbusChannel[1]), DEADZONE);
+    sbus_leftX  = applyDeadzone(normalizeSBUS(sbusChannel[3]), DEADZONE);
+    sbus_rightY = applyDeadzone(normalizeSBUS(sbusChannel[2]), DEADZONE);
+    sbus_rightX = applyDeadzone(normalizeSBUS(sbusChannel[0]), DEADZONE);
+
+    sbus_power_last = sbus_power;
+    sbus_power      = (sbusChannel[4] > 1200);
+    sbus_mode       = getDebouncedMode(sbusChannel[5]);
+}
+
+/*======================================================================
+ * System state machine
+ *======================================================================*/
+void updateSystemState() {
+    SystemState newState;
+    bool sbusAlive = (millis() - lastSBUS < 500);
+
+    if (!sbusAlive || !sbus_power) {
+        newState = STATE_DISARMED;
+    } else {
+        switch (sbus_mode) {
+            case  1: newState = STATE_ARMED_RC;      break;
+            case -1: newState = STATE_ARMED_MINIPC;  break;
+            default: newState = STATE_ARMED_NEUTRAL; break;
+        }
+    }
+
+    if (newState != currentState) {
+        if (millis() - stateChangeTime > 50) {
+            currentState  = newState;
+            stateChangeTime = millis();
+        }
+    } else {
+        stateChangeTime = millis();
+    }
+}
+
+void gradualPowerUp() {
+    static bool powerWasOn = false;
+    if (currentState != STATE_DISARMED && !powerWasOn) {
+        digitalWrite(powerRelay, HIGH);
+        delay(50);
+        powerWasOn = true;
+    } else if (currentState == STATE_DISARMED) {
+        digitalWrite(powerRelay, LOW);
+        powerWasOn = false;
+    }
+}
+
+/*======================================================================
+ * Kinematics
+ *======================================================================*/
+float velToRpm(float v) {
+    const float REDUCTION_RATIO = 100.0f;
+    const float WHEEL_RADIUS    = 0.1105f;
+    return (30.0f / M_PI) * REDUCTION_RATIO / WHEEL_RADIUS * v;
+}
+
+void ik(float v, float w) {
+    const float WHEEL_DISTANCE = 0.6f;
+    float v_l = v - (WHEEL_DISTANCE / 2.0f) * w;
+    float v_r = v + (WHEEL_DISTANCE / 2.0f) * w;
+    g_left_rpm  = velToRpm(v_l);
+    g_right_rpm = velToRpm(v_r);
+}
+
+/*======================================================================
+ * RIGHT motor only - PWM + direction pins
+ *======================================================================*/
+void writeRightMotorPwm(float right_rpm) {
+    if (right_rpm > 0) {
+        digitalWrite(mRightFWD, LOW);
+        digitalWrite(mRightREV, HIGH);
+    } else if (right_rpm < 0) {
+        digitalWrite(mRightFWD, HIGH);
+        digitalWrite(mRightREV, LOW);
+    } else {
+        digitalWrite(mRightFWD, LOW);
+        digitalWrite(mRightREV, LOW);
+    }
+    int right_pwm = constrain(map(abs(right_rpm), 0, 2000, 0, 255), 0, 255);
+    analogWrite(mmRPin, right_pwm);
+}
+
+/*======================================================================
+ * driveRobot() - called by RC and MiniPC modes
+ *======================================================================*/
+void driveRobot(float linear, float angular) {
+    linear  = constrain(linear,  -LINEAR_SPEED_MAX,  LINEAR_SPEED_MAX);
+    angular = constrain(angular, -ANGULAR_SPEED_MAX, ANGULAR_SPEED_MAX);
+
+    ik(linear, angular);
+
+    // Right motor - direct PWM (unchanged)
+    writeRightMotorPwm(g_right_rpm);
+
+    // Left motor - queue to Modbus (non-blocking, sent in modbusTask)
+    setLeftMotorModbus((int32_t)g_left_rpm);
+}
+
+/*======================================================================
+ * stopMotor()
+ * Right motor: immediate via pins
+ * Left motor:  queue stop command to Modbus (small async delay acceptable)
+ *======================================================================*/
+void stopMotor(bool motor_brake_state) {
+    // Right motor - immediate
+    if (motor_brake_state == 0) {
+        digitalWrite(mbFreeR, HIGH);
+    } else {
+        digitalWrite(mbFreeR, LOW);
+    }
+    analogWrite(mmRPin, 0);
+    digitalWrite(mRightFWD, LOW);
+    digitalWrite(mRightREV, LOW);
+
+    // Left motor - queue stop via Modbus
+    setLeftMotorModbus(0);
+}
+
+/*======================================================================
+ * Actuator helpers
+ *======================================================================*/
+void liftSBUS(float value) {
+    if      (value >  0.3f) { digitalWrite(liftFWD, HIGH); digitalWrite(liftREV, LOW);  }
+    else if (value < -0.3f) { digitalWrite(liftFWD, LOW);  digitalWrite(liftREV, HIGH); }
+    else                    { digitalWrite(liftFWD, LOW);  digitalWrite(liftREV, LOW);  }
+}
+
+void dumpSBUS(float value) {
+    if      (value >  0.3f) { digitalWrite(dumpFWD, HIGH); digitalWrite(dumpREV, LOW);  }
+    else if (value < -0.3f) { digitalWrite(dumpFWD, LOW);  digitalWrite(dumpREV, HIGH); }
+    else                    { digitalWrite(dumpFWD, LOW);  digitalWrite(dumpREV, LOW);  }
+}
+
+void sbusToVelocity(float &linear, float &angular) {
+    const float alpha = 0.35f;
+    static float filteredLX = 0.0f;
+    static float filteredLY = 0.0f;
+    filteredLX = alpha * sbus_leftX  + (1.0f - alpha) * filteredLX;
+    filteredLY = alpha * sbus_leftY  + (1.0f - alpha) * filteredLY;
+    linear  = -filteredLY * LINEAR_SPEED_MAX  * GAIN2;
+    angular = -filteredLX * ANGULAR_SPEED_MAX * GAIN1;
+}
+
+/*======================================================================
+ * Failsafe
+ *======================================================================*/
+void failsafeCheck() {
+    if (millis() - lastSBUS > 100) {
+        sbus_leftX = sbus_leftY = sbus_rightX = sbus_rightY = 0.0f;
+        stopMotor(1);
+    }
+}
+
+/*======================================================================
+ * Battery
+ *======================================================================*/
+float readBatteryVoltage() {
+    long sum = 0;
+    for (int i = 0; i < 10; i++) { sum += analogRead(BatteryPin); delay(1); }
+    float adcValue = sum / 10.0f;
+    float vA6      = adcValue * (4.1f / 1023.0f);
+    float divRatio = (51.0f + 9.1f) / 9.1f;
+    return vA6 * divRatio * 1.031f;
+}
+
+void updateBattery() {
+    static unsigned long lastBatteryRead = 0;
+    if (millis() - lastBatteryRead > 500) {
+        float v       = readBatteryVoltage();
+        filteredVolt  = 0.85f * filteredVolt + 0.15f * v;
+        lastBatteryRead = millis();
+    }
+}
+
+int calculateSOC(float voltage) {
+    if (voltage >= 29.4f) return 100;
+    if (voltage <= 18.0f) return 0;
+    if (voltage >= 27.5f) return 80 + (int)((voltage - 27.5f) * (20.0f / (29.4f - 27.5f)));
+    if (voltage >= 24.5f) return 40 + (int)((voltage - 24.5f) * (40.0f / (27.5f - 24.5f)));
+    return (int)((voltage - 18.0f) * (40.0f / (24.5f - 18.0f)));
+}
+
+void displaySOC(int soc, float voltage) {
+    lcd.setCursor(0, 0); lcd.print("BATTERY STATUS   ");
+    lcd.setCursor(0, 1); lcd.print("Volt: "); lcd.print(voltage, 1); lcd.print("V     ");
+    lcd.setCursor(0, 2); lcd.print("State: ");
+    switch (currentState) {
+        case STATE_DISARMED:      lcd.print("DISARMED"); break;
+        case STATE_ARMED_RC:      lcd.print("RC MODE "); break;
+        case STATE_ARMED_MINIPC:  lcd.print("MINI PC "); break;
+        case STATE_ARMED_NEUTRAL: lcd.print("NEUTRAL "); break;
+    }
+    lcd.print("    ");
+    lcd.setCursor(0, 3); lcd.print("SOC "); lcd.print(soc); lcd.print("% [");
+    int totalBars  = 12;
+    int filledBars = map(soc, 0, 100, 0, totalBars);
+    for (int i = 0; i < totalBars; i++) {
+        if (i < filledBars) lcd.write(255); else lcd.print(" ");
+    }
+    lcd.print("]");
+}
+
+void updateLCD() {
+    static unsigned long lastLCD = 0;
+    if (millis() - lastLCD > 500) {
+        displaySOC(calculateSOC(filteredVolt), filteredVolt);
+        lastLCD = millis();
+    }
+}
+
+/*======================================================================
+ * Mini PC serial command reader
+ *======================================================================*/
+void readMiniPC() {
+    if (Serial.available()) {
+        String data   = Serial.readStringUntil('\n');
+        int    comma  = data.indexOf(',');
+        if (comma > 0) {
+            minipc_linear   = data.substring(0, comma).toFloat();
+            minipc_angular  = data.substring(comma + 1).toFloat();
+            minipc_cmd_received = true;
+        }
+    }
+}
+
+/*======================================================================
+ * setup()
+ *======================================================================*/
+void setup() {
+    Serial.begin(115200);
+
+    // SBUS on Serial1 (pins 18 RX1 / 19 TX1) - unchanged
+    Serial1.begin(100000, SERIAL_8E2);
+
+    // Modbus on Serial2 (pins 17 RX2 / 16 TX2) at 115200 8E1
+    Serial2.begin(115200, SERIAL_8E1);
+    mb.begin(&Serial2, MODBUS_DE_RE);
+    mb.master();
+
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    for (int i = 0; i < 8; i++) lcd.createChar(i, bigChars[i]);
+
+    // Right motor driver pins
+    pinMode(mmRPin,    OUTPUT);
+    pinMode(mRightFWD, OUTPUT);
+    pinMode(mRightREV, OUTPUT);
+    pinMode(stopModeR, OUTPUT);
+    pinMode(m0R,       OUTPUT);
+    pinMode(mbFreeR,   OUTPUT);
+
+    // Modbus DE/RE pin - mb.begin() handles this but set safe default
+    pinMode(MODBUS_DE_RE, OUTPUT);
+    digitalWrite(MODBUS_DE_RE, LOW);
+
+    // Power relay - start disarmed
+    pinMode(powerRelay, OUTPUT);
+    digitalWrite(powerRelay, LOW);
+
+    // Right motor driver initial state
+    digitalWrite(stopModeR, HIGH);
+    digitalWrite(m0R,       HIGH);
+    digitalWrite(mbFreeR,   HIGH);
+
+    // Actuator pins
+    pinMode(liftFWD, OUTPUT); pinMode(liftREV, OUTPUT);
+    pinMode(dumpFWD, OUTPUT); pinMode(dumpREV, OUTPUT);
+    pinMode(LightRed, OUTPUT);
+    pinMode(BatteryPin, INPUT);
+
+    filteredVolt = readBatteryVoltage();
+    odometry.begin();
+
+    currentState  = STATE_DISARMED;
+    stateChangeTime = millis();
+}
+
+/*======================================================================
+ * loop()
+ *======================================================================*/
+void loop() {
+    // --- Always run: Modbus task (non-blocking) ---
+    modbusTask();
+
+    // --- SBUS receive and decode ---
+    readSBUS();
+    updateSBUSControl();
+
+    // --- Mini PC command ---
+    readMiniPC();
+
+    // --- Battery and LCD (low priority) ---
+    updateBattery();
+    updateLCD();
+
+    // --- System state machine ---
+    updateSystemState();
+    gradualPowerUp();
+
+    // --- Main state execution ---
+    switch (currentState) {
+
+        case STATE_DISARMED:
+            stopMotor(1);
+            digitalWrite(liftFWD, LOW); digitalWrite(liftREV, LOW);
+            digitalWrite(dumpFWD, LOW); digitalWrite(dumpREV, LOW);
+            break;
+
+        case STATE_ARMED_RC:
+            if (millis() - lastSBUS > 100) { stopMotor(1); break; }
+            {
+                float linear, angular;
+                sbusToVelocity(linear, angular);
+                driveRobot(linear, angular);
+            }
+            break;
+
+        case STATE_ARMED_MINIPC:
+            if (minipc_cmd_received) {
+                driveRobot(minipc_linear, minipc_angular);
+            } else {
+                stopMotor(1);
+            }
+            break;
+
+        case STATE_ARMED_NEUTRAL:
+            stopMotor(1);
+            break;
+    }
+
+    // --- Failsafe always runs ---
+    failsafeCheck();
+
+    // --- Odometry ---
+    odometry.update();
+    odometry.sendJson(Serial);
+
+    // No delay() - modbusTask() needs to run as fast as possible
+}

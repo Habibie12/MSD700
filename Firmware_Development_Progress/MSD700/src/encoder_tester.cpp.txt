@@ -1,0 +1,47 @@
+#include <Arduino.h>
+
+volatile long left_count = 0;
+long last_printed = 0;
+
+const int pinA = 18; // INT3
+const int pinB = 19;
+
+void readEncoderA() {
+  static uint32_t last_time = 0;
+  uint32_t now = micros();
+
+  // Ignore very fast noise (<50us)
+  if (now - last_time < 50) return;
+  last_time = now;
+
+  int B = digitalRead(pinB);
+
+  if (B == LOW) {
+    left_count++;
+  } else {
+    left_count--;
+  }
+}
+void setup() {
+  pinMode(pinA, INPUT);
+  pinMode(pinB, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(pinA), readEncoderA, RISING);
+
+  Serial.begin(115200);
+}
+
+void loop() {
+  static long last = 0;
+  long current = left_count;
+
+  if (abs(current - last_printed) > 1) {
+    Serial.println(current);
+    last_printed = current;
+  }
+
+  if (left_count != last) {
+    Serial.println(left_count);
+    last = left_count;
+  }
+}

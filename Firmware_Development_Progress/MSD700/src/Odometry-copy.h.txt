@@ -1,0 +1,51 @@
+// Odometry.h
+#ifndef ODOMETRY_H
+#define ODOMETRY_H
+
+#include <Arduino.h>
+
+// Robot physical constants
+#define ODO_WHEEL_RADIUS      0.1105f
+#define ODO_WHEEL_BASE        0.6f
+#define ODO_REDUCTION_RATIO   100.0f
+#define ODO_PPR               1024
+
+
+#define ENC_LEFT_A   A8  // PCINT16
+#define ENC_LEFT_B   A9   
+#define ENC_RIGHT_A   A10  // PCINT18
+#define ENC_RIGHT_B   A11
+
+struct OdometryData {
+    float x, y, theta;
+    float v, omega;
+};
+
+class Odometry {
+public:
+    Odometry();
+    void begin();
+    void update();
+
+    // New: send odometry as JSON over any Stream
+    void sendJson(Stream &serial);
+
+    // Old CSV method kept for reference, can be removed
+    void sendData(Stream &serial);
+
+    void reset();
+    OdometryData getData() const;
+    void onLeftEncoderA();
+
+private:
+    volatile long _leftTicks;
+    volatile int  _lastLeftA;
+    float _x, _y, _theta, _v, _omega;
+    unsigned long _lastUpdateUs;
+    long          _lastTicks;
+    float         _metersPerTick;
+};
+
+extern Odometry odometry;
+
+#endif

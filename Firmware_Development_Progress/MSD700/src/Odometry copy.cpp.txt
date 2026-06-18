@@ -1,0 +1,140 @@
+// Odometry.cpp
+#include "Odometry.h"
+#include <math.h>
+#include <PinChangeInterrupt.h>
+
+// Add a global debug counter
+volatile unsigned long isrCount = 0;
+
+Odometry odometry;
+
+static void ISR_LeftEncoderA() {
+    odometry.onLeftEncoderA();
+}
+
+Odometry::Odometry()
+    : _leftTicks(0), _lastLeftA(LOW),
+      _x(0), _y(0), _theta(0), _v(0), _omega(0),
+      _lastUpdateUs(0), _lastTicks(0), _metersPerTick(0)
+{}
+
+void Odometry::begin() {
+    float ticksPerWheelRev = (float)ODO_PPR * ODO_REDUCTION_RATIO * 2.0f;
+    _metersPerTick = (2.0f * M_PI * ODO_WHEEL_RADIUS) / ticksPerWheelRev;
+
+    pinMode(ENC_LEFT_A, INPUT);
+    pinMode(ENC_LEFT_B, INPUT);
+
+    // Enable Pin Change Interrupt bank 2, unmask A8 (PCINT16)
+    PCICR  |= (1 << PCIE2);      // enable PCINT[23:16]
+    PCMSK2 |= (1 << PCINT16);    // unmask A8
+
+    _lastUpdateUs = micros();
+    _lastTicks    = 0;
+}
+
+void Odometry::onLeftEncoderA() {
+    isrCount++;  
+
+    int stateA = digitalRead(ENC_LEFT_A);
+    int stateB = digitalRead(ENC_LEFT_B);
+
+    if (stateA == HIGH) {
+        _leftTicks += (stateB == LOW) ? 1 : -1;
+    } else {
+        _leftTicks += (stateB == HIGH) ? 1 : -1;
+    }
+}
+
+void Odometry::update() {
+    unsigned long nowUs = micros();
+    unsigned long dtUs  = nowUs - _lastUpdateUs;
+    if (dtUs < 5000UL) return;   // min 5 ms
+
+    noInterrupts();
+    long currentTicks = _leftTicks;
+    interrupts();
+
+    long deltaTicks = currentTicks - _lastTicks;
+    float dt        = (float)dtUs * 1e-6f;
+
+    float distLeft = (float)deltaTicks * _metersPerTick;
+
+    // Single‑encoder mode: assume straight line, omega = 0
+    float dist   = distLeft;
+    float dTheta = 0.0f;
+
+    float heading = _theta + dTheta / 2.0f;
+    _x     += dist * cos(heading);
+    _y     += dist * sin(heading);
+    _theta += dTheta;
+
+    while (_theta >  M_PI) _theta -= 2.0f * M_PI;
+    while (_theta < -M_PI) _theta += 2.0f * M_PI;
+
+    _v     = dist / dt;
+    _omega = dTheta / dt;
+
+    _lastTicks    = currentTicks;
+    _lastUpdateUs = nowUs;
+}
+
+// ----- JSON output -----
+void Odometry::sendJson(Stream &serial) {
+    const unsigned long INTERVAL_MS = 50;
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend < INTERVAL_MS) return;
+    lastSend = millis();
+
+    // Build JSON manually – no external library needed
+    serial.print(F("{\"type\":\"odom\",\"x\":"));
+    serial.print(_x, 4);
+    serial.print(F(",\"y\":"));
+    serial.print(_y, 4);
+    serial.print(F(",\"theta\":"));
+    serial.print(_theta, 4);
+    serial.print(F(",\"v\":"));
+    serial.print(_v, 4);
+    serial.print(F(",\"omega\":"));
+    serial.print(_omega, 4);
+    serial.println(F("}"));
+    serial.print(F(",\"isr\":"));
+    serial.print(isrCount);              // <--- print ISR count
+    serial.println(F("}"));
+}
+
+// ----- Original CSV method (kept for compatibility) -----
+void Odometry::sendData(Stream &serial) {
+    const unsigned long INTERVAL_MS = 50;
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend < INTERVAL_MS) return;
+    lastSend = millis();
+
+    serial.print("ODO,");
+    serial.print(_x, 4);      serial.print(",");
+    serial.print(_y, 4);      serial.print(",");
+    serial.print(_theta, 4);  serial.print(",");
+    serial.print(_v, 4);      serial.print(",");
+    serial.println(_omega, 4);
+}
+
+void Odometry::reset() {
+    noInterrupts();
+    _leftTicks = 0;
+    interrupts();
+    _lastTicks = 0;
+    _x = _y = _theta = 0.0f;
+    _v = _omega = 0.0f;
+    _lastUpdateUs = micros();
+}
+
+OdometryData Odometry::getData() const {
+    OdometryData d;
+    d.x = _x; d.y = _y; d.theta = _theta;
+    d.v = _v; d.omega = _omega;
+    return d;
+}
+
+ISR(PCINT2_vect) {
+    ISR_LeftEncoderA();   // calls odometry.onLeftEncoderA()
+}

@@ -1,0 +1,48 @@
+// digunakan untuk memastikan bahwa Interrupt berjalan dengan baik untuk pin PCINT
+#include <Arduino.h>
+#define ENC_A  A8   // PCINT16 (PK0)
+#define ENC_B  A9   // PCINT17 (PK1)
+
+volatile long ticks = 0;
+volatile unsigned long isrFires = 0;
+
+// Pin Change Interrupt 2 ISR (covers PORTK, bank 2)
+ISR(PCINT2_vect) {
+  isrFires++;
+  // Read pins directly from PORTK register
+  int a = (PINK >> 0) & 1;   // PK0 = A8
+  int b = (PINK >> 1) & 1;   // PK1 = A9
+
+  if (a == HIGH) {
+    ticks += (b == LOW) ? 1 : -1;
+  } else {
+    ticks += (b == HIGH) ? 1 : -1;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
+
+  pinMode(ENC_A, INPUT);
+  pinMode(ENC_B, INPUT);
+
+  // Enable Pin Change Interrupt bank 2, unmask PCINT16 (A8)
+  PCICR  |= (1 << PCIE2);      // Enable PCINT[23:16]
+  PCMSK2 |= (1 << PCINT16);    // Unmask A8 (PCINT16)
+
+  Serial.println("PCINT test on A8/A9 – rotate encoder...");
+}
+
+void loop() {
+  static unsigned long last = 0;
+  if (millis() - last > 200) {
+    last = millis();
+    Serial.print("Ticks: ");
+    Serial.print(ticks);
+    Serial.print("  ISR fires: ");
+    Serial.println(isrFires);
+    digitalWrite(13, !digitalRead(13)); // blink on-board LED
+  }
+}
